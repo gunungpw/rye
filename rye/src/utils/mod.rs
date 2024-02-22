@@ -11,7 +11,6 @@ use once_cell::sync::Lazy;
 use pep508_rs::{Requirement, VersionOrUrl};
 use regex::{Captures, Regex};
 use sha2::{Digest, Sha256};
-use toml_edit::{Array, RawString};
 
 static ENV_VAR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\$\{([A-Z0-9_]+)\}").unwrap());
 
@@ -35,6 +34,9 @@ pub(crate) mod windows;
 #[cfg(unix)]
 pub(crate) mod unix;
 
+pub(crate) mod ruff;
+pub(crate) mod toml;
+
 #[cfg(windows)]
 pub fn symlink_dir<P, Q>(original: P, link: Q) -> Result<(), std::io::Error>
 where
@@ -50,6 +52,44 @@ where
     } else {
         Ok(())
     }
+}
+
+/// Given the path to a folder this adds or removes a cloud sync flag
+/// on the folder.  Adding flags will return an error if it does not work,
+/// removing flags is silently ignored.
+///
+/// Today this only supports dropbox and apple icloud.
+pub fn mark_path_sync_ignore(venv: &Path, mark_ignore: bool) -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        #[cfg(target_os = "macos")]
+        const ATTRS: &[&str] = &["com.dropbox.ignored", "com.apple.fileprovider.ignore#P"];
+
+        // xattrs need a namespace on Linux, and try this solution on every non-mac cfg(unix) system.
+        #[cfg(not(target_os = "macos"))]
+        const ATTRS: &[&str] = &["user.com.dropbox.ignored"];
+
+        for flag in ATTRS {
+            if mark_ignore {
+                xattr::set(venv, flag, b"1")?;
+            } else {
+                xattr::remove(venv, flag).ok();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let mut stream_path = venv.as_os_str().to_os_string();
+        stream_path.push(":com.dropbox.ignored");
+        if mark_ignore {
+            fs::write(stream_path, b"1")?;
+        } else {
+            fs::remove_file(stream_path).ok();
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -347,62 +387,6 @@ pub fn check_checksum(content: &[u8], checksum: &str) -> Result<(), Error> {
         bail!("hash mismatch: expected {} got {}", checksum, digest);
     }
     Ok(())
-}
-
-/// Reformats a TOML array to multi line while trying to
-/// preserve all comments and move them around.  This also makes
-/// the array to have a trailing comma.
-pub fn reformat_toml_array_multiline(deps: &mut Array) {
-    fn find_comments(s: Option<&RawString>) -> impl Iterator<Item = &str> {
-        s.and_then(|x| x.as_str())
-            .unwrap_or("")
-            .lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                line.starts_with('#').then_some(line)
-            })
-    }
-
-    for item in deps.iter_mut() {
-        let decor = item.decor_mut();
-        let mut prefix = String::new();
-        for comment in find_comments(decor.prefix()).chain(find_comments(decor.suffix())) {
-            prefix.push_str("\n    ");
-            prefix.push_str(comment);
-        }
-        prefix.push_str("\n    ");
-        decor.set_prefix(prefix);
-        decor.set_suffix("");
-    }
-
-    deps.set_trailing(&{
-        let mut comments = find_comments(Some(deps.trailing())).peekable();
-        let mut rv = String::new();
-        if comments.peek().is_some() {
-            for comment in comments {
-                rv.push_str("\n    ");
-                rv.push_str(comment);
-            }
-        }
-        rv.push('\n');
-        rv
-    });
-    deps.set_trailing_comma(true);
-}
-
-/// Given a toml document, ensures that a given named table exists toplevel.
-///
-/// The table is created as a non inline table which is the preferred style.
-pub fn ensure_toml_table<'a>(
-    doc: &'a mut toml_edit::Document,
-    name: &str,
-) -> &'a mut toml_edit::Item {
-    if doc.as_item().get(name).is_none() {
-        let mut tbl = toml_edit::Table::new();
-        tbl.set_implicit(true);
-        doc.as_item_mut()[name] = toml_edit::Item::Table(tbl);
-    }
-    &mut doc.as_item_mut()[name]
 }
 
 pub fn escape_string(s: String) -> String {

@@ -11,6 +11,7 @@ mod fmt;
 mod init;
 mod install;
 mod lint;
+mod list;
 mod lock;
 mod make_req;
 mod pin;
@@ -18,7 +19,6 @@ mod publish;
 mod remove;
 mod run;
 mod rye;
-mod shell;
 mod shim;
 mod show;
 mod sync;
@@ -30,6 +30,7 @@ mod version;
 use git_testament::git_testament;
 
 use crate::bootstrap::SELF_PYTHON_TARGET_VERSION;
+use crate::config::Config;
 use crate::platform::symlinks_supported;
 
 git_testament!(TESTAMENT);
@@ -63,7 +64,6 @@ enum Command {
     Publish(publish::Args),
     Remove(remove::Args),
     Run(run::Args),
-    Shell(shell::Args),
     Show(show::Args),
     Sync(sync::Args),
     Toolchain(toolchain::Args),
@@ -72,14 +72,13 @@ enum Command {
     Rye(rye::Args),
     Uninstall(uninstall::Args),
     Version(version::Args),
-    #[command(hide = true)]
     List(list::Args),
+    #[command(hide = true)]
+    Shell(shell::Args),
 }
 
-pub mod list {
-    /// There is no real list command yet.
-    ///
-    /// Use rye show --installed-deps instead
+pub mod shell {
+    /// The shell command was removed.
     #[derive(clap::Parser, Debug)]
     pub struct Args {}
 }
@@ -123,7 +122,6 @@ pub fn execute() -> Result<(), Error> {
         Command::Publish(cmd) => publish::execute(cmd),
         Command::Remove(cmd) => remove::execute(cmd),
         Command::Run(cmd) => run::execute(cmd),
-        Command::Shell(cmd) => shell::execute(cmd),
         Command::Show(cmd) => show::execute(cmd),
         Command::Sync(cmd) => sync::execute(cmd),
         Command::Toolchain(cmd) => toolchain::execute(cmd),
@@ -131,10 +129,16 @@ pub fn execute() -> Result<(), Error> {
         Command::Rye(cmd) => rye::execute(cmd),
         Command::Uninstall(cmd) => uninstall::execute(cmd),
         Command::Version(cmd) => version::execute(cmd),
-        Command::List(..) => {
-            // until we have a proper list command, make it error with what the
-            // user should be using instead.
-            bail!("unknown command. Maybe you mean rye show --installed-deps");
+        Command::List(cmd) => list::execute(cmd),
+        Command::Shell(..) => {
+            bail!(
+                "unknown command. The shell command was removed. Activate the virtualenv with '{}' instead.",
+                if cfg!(windows) {
+                    ".venv\\Scripts\\activate"
+                } else {
+                    ". .venv/bin/activate"
+                }
+            );
         }
     }
 }
@@ -149,5 +153,6 @@ fn print_version() -> Result<(), Error> {
     );
     echo!("self-python: {}", SELF_PYTHON_TARGET_VERSION);
     echo!("symlink support: {}", symlinks_supported());
+    echo!("uv enabled: {}", Config::current().use_uv());
     Ok(())
 }

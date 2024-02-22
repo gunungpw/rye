@@ -28,7 +28,22 @@ enum Format {
 /// Each of the set operations takes a key=value pair. All of these can
 /// be supplied multiple times.
 #[derive(Parser, Debug)]
+#[command(arg_required_else_help(true))]
 pub struct Args {
+    /// Print the path to the config.
+    #[arg(long)]
+    show_path: bool,
+
+    #[command(flatten)]
+    action: Action,
+}
+
+#[derive(Parser, Debug)]
+#[group(required = false, multiple = true, conflicts_with = "show_path")]
+pub struct Action {
+    /// Request parseable output format rather than lines.
+    #[arg(long)]
+    format: Option<Format>,
     /// Reads a config key
     #[arg(long)]
     get: Vec<String>,
@@ -44,12 +59,6 @@ pub struct Args {
     /// Remove a config key.
     #[arg(long)]
     unset: Vec<String>,
-    /// Print the path to the config.
-    #[arg(long, conflicts_with = "format")]
-    show_path: bool,
-    /// Request parseable output format rather than lines.
-    #[arg(long)]
-    format: Option<Format>,
 }
 
 pub fn execute(cmd: Args) -> Result<(), Error> {
@@ -63,16 +72,16 @@ pub fn execute(cmd: Args) -> Result<(), Error> {
 
     let mut read_as_json = BTreeMap::new();
     let mut read_as_string = Vec::new();
-    let reads = !cmd.get.is_empty();
+    let reads = !cmd.action.get.is_empty();
 
-    for item in cmd.get {
+    for item in cmd.action.get {
         let mut ptr = Some(doc.as_item());
         for piece in item.split('.') {
             ptr = ptr.as_ref().and_then(|x| x.get(piece));
         }
 
         let val = ptr.and_then(|x| x.as_value());
-        match cmd.format {
+        match cmd.action.format {
             None => {
                 read_as_string.push(value_to_string(val));
             }
@@ -84,7 +93,7 @@ pub fn execute(cmd: Args) -> Result<(), Error> {
 
     let mut updates: Vec<(&str, Value)> = Vec::new();
 
-    for item in &cmd.set {
+    for item in &cmd.action.set {
         if let Some((key, value)) = item.split_once('=') {
             updates.push((key, Value::from(value)));
         } else {
@@ -92,7 +101,7 @@ pub fn execute(cmd: Args) -> Result<(), Error> {
         }
     }
 
-    for item in &cmd.set_int {
+    for item in &cmd.action.set_int {
         if let Some((key, value)) = item.split_once('=') {
             updates.push((
                 key,
@@ -107,7 +116,7 @@ pub fn execute(cmd: Args) -> Result<(), Error> {
         }
     }
 
-    for item in &cmd.set_bool {
+    for item in &cmd.action.set_bool {
         if let Some((key, value)) = item.split_once('=') {
             updates.push((
                 key,
@@ -122,7 +131,7 @@ pub fn execute(cmd: Args) -> Result<(), Error> {
         }
     }
 
-    let modifies = !updates.is_empty() || !cmd.unset.is_empty();
+    let modifies = !updates.is_empty() || !cmd.action.unset.is_empty();
     if modifies && reads {
         bail!("cannot mix get and set operations");
     }
@@ -140,7 +149,7 @@ pub fn execute(cmd: Args) -> Result<(), Error> {
         *ptr = value(new_value);
     }
 
-    for key in cmd.unset {
+    for key in cmd.action.unset {
         let mut ptr = doc.as_item_mut();
         if let Some((parent, key)) = key.rsplit_once('.') {
             for piece in parent.split('.') {
@@ -163,7 +172,7 @@ pub fn execute(cmd: Args) -> Result<(), Error> {
         config.save()?;
     }
 
-    match cmd.format {
+    match cmd.action.format {
         None => {
             for line in read_as_string {
                 echo!("{}", line);

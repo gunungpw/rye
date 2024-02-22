@@ -20,7 +20,7 @@ use crate::sync::VenvMarker;
 use crate::utils::CommandOutput;
 use crate::utils::{
     escape_string, expand_env_vars, format_requirement, get_short_executable_name, is_executable,
-    reformat_toml_array_multiline,
+    toml,
 };
 use anyhow::{anyhow, bail, Context, Error};
 use globset::GlobBuilder;
@@ -116,6 +116,15 @@ impl FromStr for SourceRefType {
     }
 }
 
+impl fmt::Display for SourceRefType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SourceRefType::Index => write!(f, "index"),
+            SourceRefType::FindLinks => write!(f, "find-links"),
+        }
+    }
+}
+
 /// Represents a source.
 pub struct SourceRef {
     pub name: String,
@@ -138,7 +147,7 @@ impl SourceRef {
         }
     }
 
-    pub fn from_toml_table(source: &Table) -> Result<SourceRef, Error> {
+    pub fn from_toml_table(source: &dyn TableLike) -> Result<SourceRef, Error> {
         let name = source
             .get("name")
             .and_then(|x| x.as_str())
@@ -1025,7 +1034,7 @@ fn set_dependency(deps: &mut Array, req: &Requirement) {
     } else {
         deps.push(formatted);
     }
-    reformat_toml_array_multiline(deps);
+    toml::reformat_array_multiline(deps);
 }
 
 fn remove_dependency(deps: &mut Array, req: &Requirement) -> Option<Requirement> {
@@ -1046,7 +1055,7 @@ fn remove_dependency(deps: &mut Array, req: &Requirement) -> Option<Requirement>
             .remove(idx)
             .as_str()
             .and_then(|x| Requirement::from_str(x).ok());
-        reformat_toml_array_multiline(deps);
+        toml::reformat_array_multiline(deps);
         rv
     } else {
         None
@@ -1059,13 +1068,27 @@ pub fn read_venv_marker(venv_path: &Path) -> Option<VenvMarker> {
     serde_json::from_slice(&contents).ok()
 }
 
+pub fn write_venv_marker(venv_path: &Path, py_ver: &PythonVersion) -> Result<(), Error> {
+    fs::write(
+        venv_path.join("rye-venv.json"),
+        serde_json::to_string_pretty(&VenvMarker {
+            python: py_ver.clone(),
+            venv_path: Some(venv_path.into()),
+        })?,
+    )
+    .context("failed writing venv marker file")?;
+
+    Ok(())
+}
+
 pub fn get_current_venv_python_version(venv_path: &Path) -> Option<PythonVersion> {
     read_venv_marker(venv_path).map(|x| x.python)
 }
 
 /// Give a given python version request, returns the latest available version.
 ///
-/// This can return a version that requires downloading.
+/// This can return a version that requires downloading but only if no matching
+/// Python version was found locally.
 pub fn latest_available_python_version(
     requested_version: &PythonVersionRequest,
 ) -> Option<PythonVersion> {
@@ -1084,9 +1107,13 @@ pub fn latest_available_python_version(
         Vec::new()
     };
 
-    if let Some((latest, _, _)) = get_download_url(requested_version) {
-        all.push(latest);
-    };
+    // if we don't have a match yet, try to fill it in with the latest
+    // version we are capable of fetching from the internet.
+    if all.is_empty() {
+        if let Some((latest, _, _)) = get_download_url(requested_version) {
+            all.push(latest);
+        };
+    }
 
     all.sort();
     all.into_iter().next_back()
@@ -1112,7 +1139,7 @@ fn resolve_intended_venv_python_version(
         .or_else(|| Config::current().default_toolchain().ok())
         .ok_or_else(|| {
             anyhow!(
-                "could not determine a target python version.  Define requires-python in \
+                "could not determine a target Python version.  Define requires-python in \
                  pyproject.toml or use a .python-version file"
             )
         })?;
@@ -1125,7 +1152,7 @@ fn resolve_intended_venv_python_version(
         Ok(latest)
     } else {
         Err(anyhow!(
-            "Unable to determine target virtualenv python version"
+            "Unable to determine target virtualenv Python version"
         ))
     }
 }
@@ -1201,9 +1228,10 @@ fn get_sources(doc: &Document) -> Result<Vec<SourceRef>, Error> {
         .get("tool")
         .and_then(|x| x.get("rye"))
         .and_then(|x| x.get("sources"))
-        .and_then(|x| x.as_array_of_tables())
+        .map(|x| toml::iter_tables(x))
     {
         for source in sources {
+            let source = source.context("invalid value for pyproject.toml's tool.rye.sources")?;
             let source_ref = SourceRef::from_toml_table(source)?;
             rv.push(source_ref);
         }

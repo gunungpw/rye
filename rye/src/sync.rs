@@ -9,16 +9,19 @@ use serde::{Deserialize, Serialize};
 use tempfile::tempdir;
 
 use crate::bootstrap::{ensure_self_venv, fetch, get_pip_module};
+use crate::config::Config;
 use crate::consts::VENV_BIN;
 use crate::lock::{
     make_project_root_fragment, update_single_project_lockfile, update_workspace_lockfile,
     LockMode, LockOptions,
 };
-use crate::piptools::{get_pip_sync, get_pip_tools_venv};
+use crate::piptools::{get_pip_sync, get_pip_tools_venv_path};
 use crate::platform::get_toolchain_python_bin;
-use crate::pyproject::{read_venv_marker, ExpandedSources, PyProject};
+use crate::pyproject::{read_venv_marker, write_venv_marker, ExpandedSources, PyProject};
 use crate::sources::PythonVersion;
-use crate::utils::{get_venv_python_bin, set_proxy_variables, symlink_dir, CommandOutput};
+use crate::utils::{
+    get_venv_python_bin, mark_path_sync_ignore, set_proxy_variables, symlink_dir, CommandOutput,
+};
 
 /// Controls the sync mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -69,7 +72,7 @@ impl SyncOptions {
 }
 
 /// Config written into the virtualenv for sync purposes.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct VenvMarker {
     pub python: PythonVersion,
     pub venv_path: Option<PathBuf>,
@@ -129,7 +132,7 @@ pub fn sync(mut cmd: SyncOptions) -> Result<(), Error> {
             }
         } else if cmd.force {
             if cmd.output != CommandOutput::Quiet {
-                echo!("Forcing re-creation of non rye managed virtualenv");
+                echo!("Forcing re-creation of non-rye managed virtualenv");
             }
             recreate = true;
         } else if cmd.mode == SyncMode::PythonOnly {
@@ -167,14 +170,6 @@ pub fn sync(mut cmd: SyncOptions) -> Result<(), Error> {
         let prompt = pyproject.name().unwrap_or("venv");
         create_virtualenv(output, &self_venv, &py_ver, &venv, prompt)
             .context("failed creating virtualenv ahead of sync")?;
-        fs::write(
-            venv.join("rye-venv.json"),
-            serde_json::to_string_pretty(&VenvMarker {
-                python: py_ver.clone(),
-                venv_path: Some(venv.clone().into()),
-            })?,
-        )
-        .context("failed writing venv marker file")?;
     }
 
     // prepare necessary utilities for pip-sync.  This is a super crude
@@ -242,46 +237,66 @@ pub fn sync(mut cmd: SyncOptions) -> Result<(), Error> {
             if output != CommandOutput::Quiet {
                 echo!("Installing dependencies");
             }
+
             let tempdir = tempdir()?;
-            symlink_dir(
-                get_pip_module(&get_pip_tools_venv(&py_ver)).context("could not locate pip")?,
-                tempdir.path().join("pip"),
-            )
-            .context("failed linking pip module into for pip-sync")?;
-            let mut pip_sync_cmd = Command::new(get_pip_sync(&py_ver, output)?);
-            let root = pyproject.workspace_path();
+            let mut sync_cmd = if Config::current().use_uv() {
+                let mut uv_sync_cmd = Command::new(self_venv.join(VENV_BIN).join("uv"));
+                uv_sync_cmd.arg("pip").arg("sync");
+                let root = pyproject.workspace_path();
 
-            let py_path = get_venv_python_bin(&venv);
+                uv_sync_cmd
+                    .env("PROJECT_ROOT", make_project_root_fragment(&root))
+                    .env("VIRTUAL_ENV", pyproject.venv_path().as_os_str())
+                    .current_dir(&root);
+                uv_sync_cmd
+            } else {
+                let mut pip_sync_cmd = Command::new(get_pip_sync(&py_ver, output)?);
+                let root = pyproject.workspace_path();
+                let py_path = get_venv_python_bin(&venv);
 
-            pip_sync_cmd
-                .env("PROJECT_ROOT", make_project_root_fragment(&root))
-                .env("PYTHONPATH", tempdir.path())
-                .current_dir(&root)
-                .arg("--python-executable")
-                .arg(&py_path)
-                .arg("--pip-args")
-                .arg("--no-deps");
+                // we need to run this after we have run the `get_pip_sync` command
+                // as this is what bootstraps or updates the pip tools installation.
+                // This is needed as on unix platforms we need to search the module path.
+                symlink_dir(
+                    get_pip_module(&get_pip_tools_venv_path(&py_ver))
+                        .context("could not locate pip")?,
+                    tempdir.path().join("pip"),
+                )
+                .context("failed linking pip module into for pip-sync")?;
 
-            sources.add_as_pip_args(&mut pip_sync_cmd);
+                pip_sync_cmd
+                    .env("PROJECT_ROOT", make_project_root_fragment(&root))
+                    .env("PYTHONPATH", tempdir.path())
+                    .current_dir(&root)
+                    .arg("--python-executable")
+                    .arg(&py_path)
+                    .arg("--pip-args")
+                    .arg("--no-deps");
+
+                if output != CommandOutput::Quiet {
+                    pip_sync_cmd.env("PYTHONWARNINGS", "ignore");
+                } else if output == CommandOutput::Verbose && env::var("PIP_VERBOSE").is_err() {
+                    pip_sync_cmd.env("PIP_VERBOSE", "2");
+                }
+                pip_sync_cmd
+            };
+
+            sources.add_as_pip_args(&mut sync_cmd);
 
             if cmd.dev && dev_lockfile.is_file() {
-                pip_sync_cmd.arg(&dev_lockfile);
+                sync_cmd.arg(&dev_lockfile);
             } else {
-                pip_sync_cmd.arg(&lockfile);
+                sync_cmd.arg(&lockfile);
             }
 
             if output == CommandOutput::Verbose {
-                pip_sync_cmd.arg("--verbose");
-                if env::var("PIP_VERBOSE").is_err() {
-                    pip_sync_cmd.env("PIP_VERBOSE", "2");
-                }
-            } else if output != CommandOutput::Quiet {
-                pip_sync_cmd.env("PYTHONWARNINGS", "ignore");
-            } else {
-                pip_sync_cmd.arg("-q");
+                sync_cmd.arg("--verbose");
+            } else if output == CommandOutput::Quiet {
+                sync_cmd.arg("-q");
             }
-            set_proxy_variables(&mut pip_sync_cmd);
-            let status = pip_sync_cmd.status().context("unable to run pip-sync")?;
+            set_proxy_variables(&mut sync_cmd);
+            let status = sync_cmd.status().context("unable to run pip-sync")?;
+
             if !status.success() {
                 bail!("Installation of dependencies failed");
             }
@@ -295,6 +310,19 @@ pub fn sync(mut cmd: SyncOptions) -> Result<(), Error> {
     Ok(())
 }
 
+/// Performs an autosync.
+pub fn autosync(pyproject: &PyProject, output: CommandOutput) -> Result<(), Error> {
+    sync(SyncOptions {
+        output,
+        dev: true,
+        mode: SyncMode::Regular,
+        force: false,
+        no_lock: false,
+        lock_options: LockOptions::default(),
+        pyproject: Some(pyproject.toml_path().to_path_buf()),
+    })
+}
+
 pub fn create_virtualenv(
     output: CommandOutput,
     self_venv: &Path,
@@ -303,25 +331,55 @@ pub fn create_virtualenv(
     prompt: &str,
 ) -> Result<(), Error> {
     let py_bin = get_toolchain_python_bin(py_ver)?;
-    let mut venv_cmd = Command::new(self_venv.join(VENV_BIN).join("virtualenv"));
-    if output == CommandOutput::Verbose {
-        venv_cmd.arg("--verbose");
+
+    let mut venv_cmd = if Config::current().use_uv() {
+        // try to kill the empty venv if there is one as uv can't work otherwise.
+        fs::remove_dir(venv).ok();
+        let mut venv_cmd = Command::new(self_venv.join(VENV_BIN).join("uv"));
+        venv_cmd.arg("venv");
+        if output == CommandOutput::Verbose {
+            venv_cmd.arg("--verbose");
+        } else {
+            venv_cmd.arg("-q");
+        }
+        venv_cmd.arg("-p");
+        venv_cmd.arg(&py_bin);
+        venv_cmd
     } else {
-        venv_cmd.arg("-q");
-        venv_cmd.env("PYTHONWARNINGS", "ignore");
-    }
-    venv_cmd.arg("-p");
-    venv_cmd.arg(&py_bin);
-    venv_cmd.arg("--no-seed");
-    venv_cmd.arg("--prompt");
-    venv_cmd.arg(prompt);
-    venv_cmd.arg("--");
-    venv_cmd.arg(venv);
+        // create the venv folder first so we can manipulate some flags on it.
+        fs::create_dir_all(venv)
+            .with_context(|| format!("unable to create virtualenv folder '{}'", venv.display()))?;
+
+        update_venv_sync_marker(output, venv);
+        let mut venv_cmd = Command::new(self_venv.join(VENV_BIN).join("virtualenv"));
+        if output == CommandOutput::Verbose {
+            venv_cmd.arg("--verbose");
+        } else {
+            venv_cmd.arg("-q");
+            venv_cmd.env("PYTHONWARNINGS", "ignore");
+        }
+        venv_cmd.arg("-p");
+        venv_cmd.arg(&py_bin);
+        venv_cmd.arg("--no-seed");
+        venv_cmd.arg("--prompt");
+        venv_cmd.arg(prompt);
+        venv_cmd
+    };
+
+    venv_cmd.arg("--").arg(venv);
+
     let status = venv_cmd
         .status()
         .context("unable to invoke virtualenv command")?;
     if !status.success() {
         bail!("failed to initialize virtualenv");
+    }
+
+    write_venv_marker(venv, py_ver)?;
+
+    // uv can only do it now
+    if Config::current().use_uv() {
+        update_venv_sync_marker(output, venv);
     }
 
     // On UNIX systems Python is unable to find the tcl config that is placed
@@ -333,6 +391,20 @@ pub fn create_virtualenv(
     }
 
     Ok(())
+}
+
+/// Update the cloud synchronization marker for the given path
+/// based on the config flag.
+fn update_venv_sync_marker(output: CommandOutput, venv_path: &Path) {
+    if let Err(err) = mark_path_sync_ignore(venv_path, Config::current().venv_mark_sync_ignore()) {
+        if output != CommandOutput::Quiet && Config::current().venv_mark_sync_ignore() {
+            warn!(
+                "unable to mark virtualenv {} ignored for cloud sync: {}",
+                venv_path.display(),
+                err
+            );
+        }
+    }
 }
 
 #[cfg(unix)]

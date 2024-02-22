@@ -7,7 +7,7 @@ Windows.
 ## Installing Rye
 
 Rye is installed per-user and self manages itself.  It will install itself into
-a folder in your home directory and mange itself there.
+a folder in your home directory and manage itself there.
 
 {% include-markdown "../.includes/quick-install.md" %}
 
@@ -66,7 +66,7 @@ opt-out, or you run a custom shell you will need to do this manually.
     ```
 
     In some setups `.profile` is not sourced, in which case you can add it to your
-    `.bashrc` instead:
+    `.bashrc`:
 
     ```bash
     echo 'source "$HOME/.rye/env"' >> ~/.bashrc
@@ -81,7 +81,7 @@ opt-out, or you run a custom shell you will need to do this manually.
     ```
 
     In some setups `.profile` is not sourced, in which case you can add it to your
-    `.zprofile` instead:
+    `.zprofile`:
 
     ```bash
     echo 'source "$HOME/.rye/env"' >> ~/.zprofile
@@ -89,7 +89,7 @@ opt-out, or you run a custom shell you will need to do this manually.
 
 === "Fish"
 
-    Since fish does not support `env` files, you instead need to add
+    Since fish does not support `env` files, you need to add
     the shims directly.  This can be accomplished by running this
     command once:
 
@@ -99,7 +99,7 @@ opt-out, or you run a custom shell you will need to do this manually.
 
 === "Nushell"
 
-    Since nushell does not support `env` files, you instead need to add
+    Since nushell does not support `env` files, you need to add
     the shims directly.  This can be accomplished by adding this to your
     `env.nu` file:
 

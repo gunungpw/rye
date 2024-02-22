@@ -118,11 +118,7 @@ impl From<PythonVersion> for Version {
     fn from(value: PythonVersion) -> Self {
         Version {
             epoch: 0,
-            release: vec![
-                value.major as usize,
-                value.minor as usize,
-                value.patch as usize,
-            ],
+            release: vec![value.major as u64, value.minor as u64, value.patch as u64],
             pre: None,
             post: None,
             dev: None,
@@ -136,15 +132,26 @@ impl From<PythonVersionRequest> for Version {
         Version {
             epoch: 0,
             release: vec![
-                value.major as usize,
-                value.minor.unwrap_or_default() as usize,
-                value.patch.unwrap_or_default() as usize,
+                value.major as u64,
+                value.minor.unwrap_or_default() as u64,
+                value.patch.unwrap_or_default() as u64,
             ],
             pre: None,
             post: None,
             dev: None,
             local: None,
         }
+    }
+}
+
+impl PythonVersion {
+    /// Returns a simplified format of the version request.
+    pub fn format_simple(&self) -> String {
+        use std::fmt::Write;
+        let mut rv = format!("{}", self.major);
+        write!(rv, ".{}", self.minor).unwrap();
+        write!(rv, ".{}", self.patch).unwrap();
+        rv
     }
 }
 
@@ -270,6 +277,9 @@ impl fmt::Display for PythonVersionRequest {
             write!(f, ".{}", minor)?;
             if let Some(ref patch) = self.patch {
                 write!(f, ".{}", patch)?;
+                if let Some(ref suffix) = self.suffix {
+                    write!(f, ".{}", suffix)?;
+                }
             }
         }
         Ok(())

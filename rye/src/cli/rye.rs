@@ -15,14 +15,14 @@ use self_replace::self_delete_outside_path;
 use tempfile::tempdir;
 
 use crate::bootstrap::{
-    download_url, download_url_ignore_404, ensure_self_venv, is_self_compatible_toolchain,
-    update_core_shims, SELF_PYTHON_TARGET_VERSION,
+    download_url, download_url_ignore_404, ensure_self_venv_with_toolchain,
+    is_self_compatible_toolchain, update_core_shims, SELF_PYTHON_TARGET_VERSION,
 };
 use crate::cli::toolchain::register_toolchain;
 use crate::config::Config;
 use crate::platform::{get_app_dir, symlinks_supported};
 use crate::sources::{get_download_url, PythonVersionRequest};
-use crate::utils::{check_checksum, ensure_toml_table, tui_theme, CommandOutput, QuietExit};
+use crate::utils::{check_checksum, toml, tui_theme, CommandOutput, QuietExit};
 
 #[cfg(windows)]
 const DEFAULT_HOME: &str = "%USERPROFILE%\\.rye";
@@ -93,6 +93,53 @@ pub struct InstallCommand {
     /// Register a specific toolchain before bootstrap.
     #[arg(long)]
     toolchain: Option<PathBuf>,
+    /// Use a specific toolchain version.
+    #[arg(long)]
+    toolchain_version: Option<PythonVersionRequest>,
+
+    #[command(flatten)]
+    mp: ModifyPath,
+}
+
+#[derive(Parser, Debug)]
+#[group(required = false, multiple = false)]
+pub struct ModifyPath {
+    /// Always modify without asking the PATH environment variable.
+    #[arg(long)]
+    modify_path: bool,
+    /// Do not modify the PATH environment variable.
+    #[arg(long)]
+    no_modify_path: bool,
+}
+
+#[derive(Debug, Copy, Clone)]
+enum YesNoArg {
+    Yes,
+    No,
+    Ask,
+}
+
+impl YesNoArg {
+    fn with_yes(&self, yes: bool) -> Self {
+        match (yes, self) {
+            (true, Self::Ask) => Self::Yes,
+            _ => *self,
+        }
+    }
+}
+impl From<ModifyPath> for YesNoArg {
+    fn from(other: ModifyPath) -> Self {
+        // Argument parsing logic is a bit complex here:
+        match (other.modify_path, other.no_modify_path) {
+            // 1. If --modify-path is set and --no-modify-path is not set, we always modify the path without prompting.
+            (true, false) => YesNoArg::Yes,
+            // 2. If --no-modify-path is set and --modify-path is not set, we never modify the path.
+            (false, true) => YesNoArg::No,
+            // 3. Otherwise we ask the user
+            (false, false) => YesNoArg::Ask,
+            (true, true) => unreachable!(),
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -259,6 +306,8 @@ fn install(args: InstallCommand) -> Result<(), Error> {
             InstallMode::Default
         },
         args.toolchain.as_deref(),
+        args.toolchain_version,
+        YesNoArg::from(args.mp).with_yes(args.yes),
     )
 }
 
@@ -295,6 +344,7 @@ fn uninstall(args: UninstallCommand) -> Result<(), Error> {
         remove_dir_all_if_exists(&app_dir.join("self"))?;
         remove_dir_all_if_exists(&app_dir.join("py"))?;
         remove_dir_all_if_exists(&app_dir.join("pip-tools"))?;
+        remove_dir_all_if_exists(&app_dir.join("tools"))?;
 
         // special deleting logic if we are placed in the app dir and the shim deletion
         // did not succeed.  This is likely the case on windows where we then use the
@@ -343,7 +393,12 @@ fn is_fish() -> bool {
     Shell::infer().map_or(false, |x| matches!(x, Shell::Fish))
 }
 
-fn perform_install(mode: InstallMode, toolchain_path: Option<&Path>) -> Result<(), Error> {
+fn perform_install(
+    mode: InstallMode,
+    toolchain_path: Option<&Path>,
+    toolchain_version: Option<PythonVersionRequest>,
+    modify_path: YesNoArg,
+) -> Result<(), Error> {
     let mut config = Config::current();
     let mut registered_toolchain: Option<PythonVersionRequest> = None;
     let config_doc = Arc::make_mut(&mut config).doc_mut();
@@ -353,12 +408,32 @@ fn perform_install(mode: InstallMode, toolchain_path: Option<&Path>) -> Result<(
     let target = shims.join("rye").with_extension(EXE_EXTENSION);
     let mut prompt_for_toolchain_later = false;
 
+    // When we perform an install and a toolchain path has not been passed,
+    // we always also pick up on the RYE_TOOLCHAIN environment variable
+    // as a fallback.
+    let toolchain_path = match toolchain_path {
+        Some(path) => Some(Cow::Borrowed(path)),
+        None => env::var_os("RYE_TOOLCHAIN")
+            .map(PathBuf::from)
+            .map(Cow::Owned),
+    };
+
+    // Also pick up the target version from the RYE_TOOLCHAIN_VERSION
+    // environment variable.
+    let toolchain_version_request = match toolchain_version {
+        Some(version) => Some(version),
+        None => match env::var("RYE_TOOLCHAIN_VERSION") {
+            Ok(val) => Some(val.parse()?),
+            Err(_) => None,
+        },
+    };
+
     echo!("{}", style("Welcome to Rye!").bold());
 
     if matches!(mode, InstallMode::AutoInstall) {
         echo!();
         echo!("Rye has detected that it's not installed on this computer yet and");
-        echo!("automatically started the installer for you.  For more information");
+        echo!("automatically started the installer for you. For more information");
         echo!(
             "read {}",
             style("https://rye-up.com/guide/installation/").yellow()
@@ -378,13 +453,25 @@ fn perform_install(mode: InstallMode, toolchain_path: Option<&Path>) -> Result<(
     echo!("{}", style("Details:").bold());
     echo!("  Rye Version: {}", style(env!("CARGO_PKG_VERSION")).cyan());
     echo!("  Platform: {} ({})", style(OS).cyan(), style(ARCH).cyan());
+    if let Some(ref toolchain_path) = toolchain_path {
+        echo!(
+            "  Internal Toolchain Path: {}",
+            style(toolchain_path.display()).cyan()
+        );
+    }
+    if let Some(ref toolchain_version_request) = toolchain_version_request {
+        echo!(
+            "  Internal Toolchain Version: {}",
+            style(toolchain_version_request).cyan()
+        );
+    }
 
     if cfg!(windows) && !symlinks_supported() {
         echo!();
         warn!("your Windows configuration does not support symlinks.");
         echo!();
         echo!("It's strongly recommended that you enable developer mode in Windows to");
-        echo!("enable symlinks.  You need to enable this before continuing the setup.");
+        echo!("enable symlinks. You need to enable this before continuing the setup.");
         echo!(
             "Learn more at {}",
             style("https://rye-up.com/guide/faq/#windows-developer-mode").yellow()
@@ -401,6 +488,23 @@ fn perform_install(mode: InstallMode, toolchain_path: Option<&Path>) -> Result<(
         return Err(QuietExit(1).into());
     }
 
+    // Use uv?
+    if config_doc
+        .get("behavior")
+        .and_then(|x| x.get("use-uv"))
+        .is_none()
+        && !matches!(mode, InstallMode::NoPrompts)
+        && dialoguer::Select::with_theme(tui_theme())
+            .with_prompt("Select the preferred package installer")
+            .item("pip-tools (slow but stable)")
+            .item("uv (quick but experimental)")
+            .default(0)
+            .interact()?
+            == 1
+    {
+        toml::ensure_table(config_doc, "behavior")["use-uv"] = toml_edit::value(true);
+    }
+
     // If the global-python flag is not in the settings, ask the user if they want to turn
     // on global shims upon installation.
     if config_doc
@@ -409,21 +513,26 @@ fn perform_install(mode: InstallMode, toolchain_path: Option<&Path>) -> Result<(
         .is_none()
         && (matches!(mode, InstallMode::NoPrompts)
             || dialoguer::Select::with_theme(tui_theme())
-                .with_prompt("Determine Rye's python Shim behavior outside of Rye managed projects")
-                .item("Make Rye's own Python distribution available")
-                .item("Transparently pass through to non Rye (system, pyenv, etc.) Python")
+                .with_prompt("What should running `python` or `python3` do when you are not inside a Rye managed project?")
+                .item("Run a Python installed and managed by Rye")
+                .item("Run the old default Python (provided by your OS, pyenv, etc.)")
                 .default(0)
                 .interact()?
                 == 0)
     {
-        ensure_toml_table(config_doc, "behavior")["global-python"] = toml_edit::value(true);
+        toml::ensure_table(config_doc, "behavior")["global-python"] = toml_edit::value(true);
 
         // configure the default toolchain.  If we are not using a pre-configured toolchain we
         // can ask now, otherwise we need to wait for the toolchain to be available before we
         // can fill in the default.
         if !matches!(mode, InstallMode::NoPrompts) {
             if toolchain_path.is_none() {
-                prompt_for_default_toolchain(SELF_PYTHON_TARGET_VERSION, config_doc)?;
+                prompt_for_default_toolchain(
+                    toolchain_version_request
+                        .clone()
+                        .unwrap_or(SELF_PYTHON_TARGET_VERSION),
+                    config_doc,
+                )?;
             } else {
                 prompt_for_toolchain_later = true;
             }
@@ -457,7 +566,7 @@ fn perform_install(mode: InstallMode, toolchain_path: Option<&Path>) -> Result<(
             "Registering toolchain at {}",
             style(toolchain_path.display()).cyan()
         );
-        let version = register_toolchain(toolchain_path, None, |ver| {
+        let version = register_toolchain(&toolchain_path, None, |ver| {
             if ver.name != "cpython" {
                 bail!("Only cpython toolchains are allowed, got '{}'", ver.name);
             } else if !is_self_compatible_toolchain(ver) {
@@ -473,7 +582,8 @@ fn perform_install(mode: InstallMode, toolchain_path: Option<&Path>) -> Result<(
     }
 
     // Ensure internals next
-    let self_path = ensure_self_venv(CommandOutput::Normal)?;
+    let self_path =
+        ensure_self_venv_with_toolchain(CommandOutput::Normal, toolchain_version_request)?;
     echo!(
         "Updated self-python installation at {}",
         style(self_path.display()).cyan()
@@ -484,11 +594,44 @@ fn perform_install(mode: InstallMode, toolchain_path: Option<&Path>) -> Result<(
         prompt_for_default_toolchain(registered_toolchain.unwrap(), config_doc)?;
     }
 
+    match modify_path {
+        YesNoArg::Yes => {
+            add_rye_to_path(&mode, shims.as_path(), false)?;
+        }
+        YesNoArg::No => {
+            echo!(
+                "Skipping PATH modification. You will need to add {} to your PATH manually.",
+                style(shims.display()).cyan()
+            );
+        }
+        YesNoArg::Ask => {
+            add_rye_to_path(&mode, shims.as_path(), true)?;
+        }
+    }
+
+    echo!();
+    echo!("{}", style("All done!").green());
+
+    config.save()?;
+
+    Ok(())
+}
+
+/// Add rye to the users path.
+#[cfg_attr(windows, allow(unused_variables))]
+fn add_rye_to_path(mode: &InstallMode, shims: &Path, ask: bool) -> Result<(), Error> {
+    let rye_home = env::var("RYE_HOME")
+        .map(Cow::Owned)
+        .unwrap_or(Cow::Borrowed(DEFAULT_HOME));
+
     let rye_home = Path::new(&*rye_home);
+    // For unices, we ask the user if they want rye to be added to PATH.
+    // If they choose to do so, we add the "env" script to .profile.
+    // See [`crate::utils::unix::add_to_path`].
     #[cfg(unix)]
     {
         if !env::split_paths(&env::var_os("PATH").unwrap())
-            .any(|x| same_file::is_same_file(x, &shims).unwrap_or(false))
+            .any(|x| same_file::is_same_file(x, shims).unwrap_or(false))
         {
             echo!();
             echo!(
@@ -499,6 +642,7 @@ fn perform_install(mode: InstallMode, toolchain_path: Option<&Path>) -> Result<(
             echo!("It is highly recommended that you add it.");
 
             if matches!(mode, InstallMode::NoPrompts)
+                || !ask
                 || dialoguer::Confirm::with_theme(tui_theme())
                     .with_prompt(format!(
                         "Should the installer add Rye to {} via .profile?",
@@ -531,20 +675,15 @@ fn perform_install(mode: InstallMode, toolchain_path: Option<&Path>) -> Result<(
                 );
                 echo!();
             }
-            echo!("For more information read https://mitsuhiko.github.io/rye/guide/installation");
+            echo!("For more information read https://rye-up.com/guide/installation/");
         }
     }
+    // On Windows, we add the rye directory to the user's PATH unconditionally.
     #[cfg(windows)]
     {
         crate::utils::windows::add_to_programs(rye_home)?;
         crate::utils::windows::add_to_path(rye_home)?;
     }
-
-    echo!();
-    echo!("{}", style("All done!").green());
-
-    config.save()?;
-
     Ok(())
 }
 
@@ -566,7 +705,7 @@ fn prompt_for_default_toolchain(
                 .ok_or_else(|| anyhow!("Unavailable version '{}'", version))
         })
         .interact_text()?;
-    ensure_toml_table(config_doc, "default")["toolchain"] = toml_edit::value(choice.to_string());
+    toml::ensure_table(config_doc, "default")["toolchain"] = toml_edit::value(choice.to_string());
     Ok(())
 }
 
@@ -575,10 +714,6 @@ pub fn auto_self_install() -> Result<bool, Error> {
     if env::var("RYE_NO_AUTO_INSTALL").ok().as_deref() == Some("1") {
         return Ok(false);
     }
-
-    // auto install reads RYE_TOOLCHAIN to pre-register a
-    // regular toolchain.
-    let toolchain_path = env::var_os("RYE_TOOLCHAIN");
 
     let app_dir = get_app_dir();
     let rye_exe = app_dir
@@ -597,10 +732,7 @@ pub fn auto_self_install() -> Result<bool, Error> {
             crate::request_continue_prompt();
         }
 
-        perform_install(
-            InstallMode::AutoInstall,
-            toolchain_path.as_ref().map(Path::new),
-        )?;
+        perform_install(InstallMode::AutoInstall, None, None, YesNoArg::Yes)?;
         Ok(true)
     }
 }

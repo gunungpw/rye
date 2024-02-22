@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::consts::VENV_BIN;
 use crate::platform::{get_python_version_request_from_pyenv_pin, get_toolchain_python_bin};
 use crate::pyproject::{latest_available_python_version, PyProject};
-use crate::sources::{PythonVersion, PythonVersionRequest};
+use crate::sources::PythonVersionRequest;
 use crate::sync::{sync, SyncOptions};
 use crate::tui::redirect_to_stderr;
 use crate::utils::{exec_spawn, get_venv_python_bin, CommandOutput};
@@ -236,7 +236,7 @@ fn get_shim_target(
             remove1 = true;
             (
                 PythonVersionRequest::from_str(rest)
-                    .context("invalid python version requested from command line")?,
+                    .context("invalid Python version requested from command line")?,
                 false,
             )
         } else if config.global_python() {
@@ -253,11 +253,8 @@ fn get_shim_target(
             return find_shadowed_target(target, args);
         };
 
-        let py_ver = match PythonVersion::try_from(version_request.clone()) {
-            Ok(py_ver) => py_ver,
-            Err(_) => latest_available_python_version(&version_request)
-                .ok_or_else(|| anyhow!("Unable to determine target Python version"))?,
-        };
+        let py_ver = latest_available_python_version(&version_request)
+            .ok_or_else(|| anyhow!("Unable to determine target Python version"))?;
         let py = get_toolchain_python_bin(&py_ver)?;
         if !py.is_file() {
             let hint = if implicit_request {
@@ -320,9 +317,14 @@ pub fn execute_shim(args: &[OsString]) -> Result<(), Error> {
             match spawn_shim(args)? {}
         } else if is_python_shim(&shim_name) {
             if pyproject.is_some() {
-                bail!("target python binary '{}' not found in project. Most likely running 'rye sync' will resolve this.", shim_name);
+                bail!("Target Python binary '{}' not found in project. Most likely running 'rye sync' will resolve this.", shim_name);
             } else {
-                bail!("target python binary '{}' not found. You're outside of a project, consider enabling global shims: https://rye-up.com/guide/shims/#global-shims", shim_name);
+                bail!(
+                    "Target Python binary '{}' not found.\nYou are currently outside of a project. \
+                    To resolve this, consider enabling global shims. \
+                    Global shims allow for a Rye-managed Python installation.\n\
+                    For more information: https://rye-up.com/guide/shims/#global-shims", shim_name
+                );
             }
         } else {
             bail!("target shim binary '{}' not found", shim_name);
