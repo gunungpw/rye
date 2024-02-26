@@ -15,15 +15,14 @@ use serde::Serialize;
 use tempfile::NamedTempFile;
 use url::Url;
 
-use crate::bootstrap::ensure_self_venv;
 use crate::config::Config;
-use crate::consts::VENV_BIN;
 use crate::piptools::{get_pip_compile, get_pip_tools_version, PipToolsVersion};
 use crate::pyproject::{
     normalize_package_name, DependencyKind, ExpandedSources, PyProject, Workspace,
 };
-use crate::sources::PythonVersion;
-use crate::utils::{set_proxy_variables, CommandOutput};
+use crate::sources::py::PythonVersion;
+use crate::utils::{set_proxy_variables, CommandOutput, IoPathContext};
+use crate::uv::Uv;
 
 static FILE_EDITABLE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^-e (file://.*?)\s*$").unwrap());
 static DEP_COMMENT_RE: Lazy<Regex> =
@@ -331,6 +330,8 @@ pub fn update_single_project_lockfile(
         }
     }
 
+    req_file.flush()?;
+
     let exclusions = find_exclusions(std::slice::from_ref(pyproject))?;
     generate_lockfile(
         output,
@@ -359,32 +360,35 @@ fn generate_lockfile(
     exclusions: &HashSet<Requirement>,
     no_deps: bool,
 ) -> Result<(), Error> {
+    let use_uv = Config::current().use_uv();
     let scratch = tempfile::tempdir()?;
     let requirements_file = scratch.path().join("requirements.txt");
     let lock_options = if lockfile.is_file() {
         let requirements = fs::read_to_string(lockfile)?;
-        fs::write(&requirements_file, &requirements)?;
+        fs::write(&requirements_file, &requirements)
+            .path_context(&requirements_file, "unable to restore requirements file")?;
         LockOptions::restore(&requirements, lock_options)?
     } else {
-        fs::write(&requirements_file, b"")?;
+        if !use_uv {
+            fs::write(&requirements_file, b"").path_context(
+                &requirements_file,
+                "unable to write empty requirements file",
+            )?;
+        }
         Cow::Borrowed(lock_options)
     };
 
-    let mut cmd = if Config::current().use_uv() {
-        let self_venv = ensure_self_venv(output)?;
-        let mut cmd = Command::new(self_venv.join(VENV_BIN).join("uv"));
+    let mut cmd = if use_uv {
+        let mut cmd = Uv::ensure_exists(output)?.cmd();
         cmd.arg("pip")
             .arg("compile")
             .arg("--no-header")
+            .env_remove("VIRTUAL_ENV")
             .arg(format!(
                 "--python-version={}.{}.{}",
                 py_ver.major, py_ver.minor, py_ver.patch
             ));
-        if output == CommandOutput::Verbose {
-            cmd.arg("--verbose");
-        } else if output == CommandOutput::Quiet {
-            cmd.arg("-q");
-        }
+
         if lock_options.pre {
             cmd.arg("--prerelease=allow");
         }
@@ -463,7 +467,8 @@ fn finalize_lockfile(
     sources: &ExpandedSources,
     lock_options: &LockOptions,
 ) -> Result<(), Error> {
-    let mut rv = BufWriter::new(fs::File::create(out)?);
+    let mut rv =
+        BufWriter::new(fs::File::create(out).path_context(out, "unable to finalize lockfile")?);
     lock_options.write_header(&mut rv)?;
 
     // only if we are asked to include sources we do that.
@@ -472,7 +477,10 @@ fn finalize_lockfile(
         writeln!(rv)?;
     }
 
-    for line in fs::read_to_string(generated)?.lines() {
+    for line in fs::read_to_string(generated)
+        .path_context(generated, "unable to parse resolver output")?
+        .lines()
+    {
         // we deal with this explicitly.
         if line.trim().is_empty()
             || line.starts_with("--index-url ")

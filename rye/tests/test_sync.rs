@@ -1,3 +1,5 @@
+use std::fs;
+
 use crate::common::{rye_cmd_snapshot, Space};
 
 mod common;
@@ -11,23 +13,35 @@ fn test_empty_sync() {
     exit_code: 0
     ----- stdout -----
     Initializing new virtualenv in [TEMP_PATH]/project/.venv
-    Python version: cpython@3.12.1
+    Python version: cpython@3.12.2
     Generating production lockfile: [TEMP_PATH]/project/requirements.lock
     Generating dev lockfile: [TEMP_PATH]/project/requirements-dev.lock
     Installing dependencies
     Done!
 
     ----- stderr -----
-    warning: Requirements file [TEMP_FILE] does not contain any dependencies
     Built 1 editable in [EXECUTION_TIME]
     Resolved 1 package in [EXECUTION_TIME]
-    warning: Requirements file [TEMP_FILE] does not contain any dependencies
     Built 1 editable in [EXECUTION_TIME]
     Resolved 1 package in [EXECUTION_TIME]
     Built 1 editable in [EXECUTION_TIME]
     Installed 1 package in [EXECUTION_TIME]
      + my-project==0.1.0 (from file:[TEMP_PATH]/project)
     "###);
+
+    // is the prompt set?
+    #[cfg(unix)]
+    {
+        let script = space.venv_path().join("bin/activate");
+        let contents = fs::read_to_string(script).unwrap();
+        assert!(contents.contains("VIRTUAL_ENV_PROMPT=\"my-project\""));
+    }
+    #[cfg(windows)]
+    {
+        let script = space.venv_path().join("Scripts/activate.bat");
+        let contents = fs::read_to_string(script).unwrap();
+        assert!(contents.contains("@set \"VIRTUAL_ENV_PROMPT=my-project\""));
+    }
 }
 
 #[test]
@@ -41,7 +55,7 @@ fn test_add_and_sync_no_auto_sync() {
     exit_code: 0
     ----- stdout -----
     Initializing new virtualenv in [TEMP_PATH]/project/.venv
-    Python version: cpython@3.12.1
+    Python version: cpython@3.12.2
     Added colorama>=0.4.6 as regular dependency
     Added flask>=3.0.0 as regular dependency
 
@@ -58,10 +72,8 @@ fn test_add_and_sync_no_auto_sync() {
     Done!
 
     ----- stderr -----
-    warning: Requirements file [TEMP_FILE] does not contain any dependencies
     Built 1 editable in [EXECUTION_TIME]
     Resolved 9 packages in [EXECUTION_TIME]
-    warning: Requirements file [TEMP_FILE] does not contain any dependencies
     Built 1 editable in [EXECUTION_TIME]
     Resolved 9 packages in [EXECUTION_TIME]
     Built 1 editable in [EXECUTION_TIME]
@@ -90,7 +102,7 @@ fn test_add_autosync() {
     exit_code: 0
     ----- stdout -----
     Initializing new virtualenv in [TEMP_PATH]/project/.venv
-    Python version: cpython@3.12.1
+    Python version: cpython@3.12.2
     Added colorama>=0.4.6 as regular dependency
     Added flask>=3.0.0 as regular dependency
     Reusing already existing virtualenv
@@ -100,10 +112,8 @@ fn test_add_autosync() {
     Done!
 
     ----- stderr -----
-    warning: Requirements file [TEMP_FILE] does not contain any dependencies
     Built 1 editable in [EXECUTION_TIME]
     Resolved 9 packages in [EXECUTION_TIME]
-    warning: Requirements file [TEMP_FILE] does not contain any dependencies
     Built 1 editable in [EXECUTION_TIME]
     Resolved 9 packages in [EXECUTION_TIME]
     Built 1 editable in [EXECUTION_TIME]
